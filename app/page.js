@@ -1,11 +1,14 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabase';
+import StockWorkflow from '@/components/StockWorkflow';
+import ReportsDashboard from '@/components/ReportsDashboard';
 
 export default function AtlasDepoApp() {
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
+  const [profiles, setProfiles] = useState([]);
   const [authLoading, setAuthLoading] = useState(true);
 
   // Giriş formu durumları
@@ -18,13 +21,12 @@ export default function AtlasDepoApp() {
   const [locations, setLocations] = useState([]);
   const [products, setProducts] = useState([]);
   const [stocks, setStocks] = useState([]);
+  const [transactions, setTransactions] = useState([]);
   const [dataLoading, setDataLoading] = useState(false);
+  const [dataError, setDataError] = useState('');
 
-  // Filtreler
-  const [selectedWarehouse, setSelectedWarehouse] = useState('ALL');
-  const [selectedCategory, setSelectedCategory] = useState('ALL');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [onlyCritical, setOnlyCritical] = useState(false);
+  // Depo sorumlusu ana menü durumu: 'MENU' | 'OPERATIONS' | 'REPORTS'
+  const [supervisorView, setSupervisorView] = useState('MENU');
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -43,28 +45,47 @@ export default function AtlasDepoApp() {
 
   useEffect(() => {
     if (session?.user) {
+      setSupervisorView('MENU');
       loadAllData(session.user.id);
     } else {
       setProfile(null);
+      setProfiles([]);
       setLocations([]);
       setProducts([]);
       setStocks([]);
+      setTransactions([]);
+      setSupervisorView('MENU');
     }
   }, [session]);
 
   async function loadAllData(userId) {
     setDataLoading(true);
-    const [profRes, locRes, prodRes, stockRes] = await Promise.all([
+    setDataError('');
+
+    const [profRes, allProfRes, locRes, prodRes, stockRes, txRes] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', userId).single(),
+      supabase.from('profiles').select('*'),
       supabase.from('locations').select('*').order('warehouse_code').order('shelf_code'),
       supabase.from('products').select('*').order('sku'),
       supabase.from('stocks').select('*'),
+      supabase
+        .from('stock_transactions')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(250),
     ]);
 
+    const firstError = locRes.error || prodRes.error || stockRes.error || txRes.error;
+    if (firstError) {
+      setDataError(`Veritabanı okuma hatası: ${firstError.message}`);
+    }
+
     if (profRes.data) setProfile(profRes.data);
+    if (allProfRes.data) setProfiles(allProfRes.data);
     if (locRes.data) setLocations(locRes.data);
     if (prodRes.data) setProducts(prodRes.data);
     if (stockRes.data) setStocks(stockRes.data);
+    if (txRes.data) setTransactions(txRes.data);
     setDataLoading(false);
   }
 
@@ -88,73 +109,7 @@ export default function AtlasDepoApp() {
     await supabase.auth.signOut();
   }
 
-  // Stok satırlarını ürün ve depo/raf bilgisiyle birleştir
-  const enrichedStocks = useMemo(() => {
-    const productMap = new Map(products.map((p) => [p.id, p]));
-    const locationMap = new Map(locations.map((l) => [l.id, l]));
-
-    return stocks
-      .map((s) => {
-        const product = productMap.get(s.product_id);
-        const location = locationMap.get(s.location_id);
-        if (!product || !location) return null;
-        return {
-          ...s,
-          product,
-          location,
-          isCritical: s.quantity <= product.min_stock_level,
-        };
-      })
-      .filter(Boolean)
-      .sort((a, b) => {
-        if (a.location.warehouse_code !== b.location.warehouse_code) {
-          return a.location.warehouse_code.localeCompare(b.location.warehouse_code);
-        }
-        return a.product.sku.localeCompare(b.product.sku);
-      });
-  }, [stocks, products, locations]);
-
-  const categories = useMemo(() => {
-    return Array.from(new Set(products.map((p) => p.category)));
-  }, [products]);
-
-  const filteredStocks = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    return enrichedStocks.filter((row) => {
-      if (selectedWarehouse !== 'ALL' && row.location.warehouse_code !== selectedWarehouse) {
-        return false;
-      }
-      if (selectedCategory !== 'ALL' && row.product.category !== selectedCategory) {
-        return false;
-      }
-      if (onlyCritical && !row.isCritical) {
-        return false;
-      }
-      if (q) {
-        const matchSku = row.product.sku.toLowerCase().includes(q);
-        const matchName = row.product.name.toLowerCase().includes(q);
-        const matchBrand = row.product.brand.toLowerCase().includes(q);
-        const matchShelf = row.location.shelf_code.toLowerCase().includes(q);
-        return matchSku || matchName || matchBrand || matchShelf;
-      }
-      return true;
-    });
-  }, [enrichedStocks, selectedWarehouse, selectedCategory, onlyCritical, searchQuery]);
-
-  const stats = useMemo(() => {
-    const scopeRows =
-      selectedWarehouse === 'ALL'
-        ? enrichedStocks
-        : enrichedStocks.filter((r) => r.location.warehouse_code === selectedWarehouse);
-
-    const totalUnits = scopeRows.reduce((acc, r) => acc + r.quantity, 0);
-    const criticalCount = scopeRows.filter((r) => r.isCritical).length;
-    return {
-      recordCount: scopeRows.length,
-      totalUnits,
-      criticalCount,
-    };
-  }, [enrichedStocks, selectedWarehouse]);
+  const isSupervisor = profile?.role === 'sorumlu';
 
   if (authLoading) {
     return (
@@ -175,7 +130,7 @@ export default function AtlasDepoApp() {
             </span>
             <h1 className="text-2xl font-bold text-slate-900">Atlas Depo Sistemi</h1>
             <p className="text-sm text-slate-500 mt-1">
-              Pamukkale, Merkezefendi ve Acıpayam depoları için kullanıcı girişi yapın.
+              Devam etmek için kullanıcı hesabınızla giriş yapın.
             </p>
           </div>
 
@@ -249,18 +204,17 @@ export default function AtlasDepoApp() {
     );
   }
 
-  // ANA UYGULAMA EKRANI (STOK SORGULAMA VE KRİTİK UYARILAR)
   return (
     <div className="min-h-screen bg-slate-100 text-slate-900">
-      {/* Üst Başlık */}
+      {/* Üst Çubuk */}
       <header className="bg-slate-900 text-white sticky top-0 z-20 shadow">
-        <div className="max-w-7xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="text-lg font-bold tracking-tight">Atlas Depo Takip</h1>
             <p className="text-xs text-slate-300">
               {profile?.full_name || session.user.email} •{' '}
               <span className="uppercase font-semibold text-amber-300">
-                {profile?.role === 'sorumlu' ? 'Depo Sorumlusu' : 'Depo Personeli'}
+                {isSupervisor ? 'Depo Sorumlusu' : 'Depo Personeli'}
               </span>
             </p>
           </div>
@@ -281,166 +235,93 @@ export default function AtlasDepoApp() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 py-5 space-y-5">
-        {/* Özet Kartlar */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <div className="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
-            <p className="text-xs font-medium text-slate-500">Kayıtlı Stok Kalemi</p>
-            <p className="text-2xl font-bold text-slate-900 mt-1">{stats.recordCount}</p>
-            <p className="text-xs text-slate-400 mt-0.5">53 ürün • 36 raf bölgesi</p>
+      <main className="max-w-6xl mx-auto px-4 py-6">
+        {dataError && (
+          <div className="mb-5 p-4 rounded-xl bg-red-50 border border-red-300 text-sm text-red-800 font-medium">
+            {dataError}
           </div>
+        )}
 
-          <div className="bg-white rounded-xl p-4 shadow-sm border border-slate-200">
-            <p className="text-xs font-medium text-slate-500">Toplam Fiziksel Stok</p>
-            <p className="text-2xl font-bold text-blue-700 mt-1">
-              {stats.totalUnits.toLocaleString('tr-TR')}
-            </p>
-            <p className="text-xs text-slate-400 mt-0.5">Koli / Paket / Şişe / Kutu toplamı</p>
-          </div>
+        {/* DEPO SORUMLUSU İLK GİRİŞ EKRANI (2 SEÇENEK: İŞLEM YAP / RAPORLAR) */}
+        {isSupervisor && supervisorView === 'MENU' ? (
+          <div className="max-w-3xl mx-auto space-y-6 pt-4">
+            <div className="bg-white rounded-2xl p-6 shadow-sm border border-slate-200">
+              <span className="inline-block px-3 py-1 text-xs font-semibold bg-amber-100 text-amber-800 rounded-full mb-2">
+                Depo Sorumlusu Kontrol Paneli
+              </span>
+              <h2 className="text-2xl font-bold text-slate-900">Hoş Geldiniz, Ne Yapmak İstersiniz?</h2>
+              <p className="text-sm text-slate-500 mt-1">
+                Depo operasyonlarını yürütmek için <strong>İşlem Yap</strong> bölümünü, stok ve personel analizlerini incelemek için <strong>Raporlar</strong> bölümünü seçin.
+              </p>
+            </div>
 
-          <button
-            type="button"
-            onClick={() => setOnlyCritical((prev) => !prev)}
-            className={`text-left rounded-xl p-4 shadow-sm border transition ${
-              onlyCritical
-                ? 'bg-red-600 text-white border-red-700'
-                : 'bg-white text-slate-900 border-slate-200 hover:border-red-300'
-            }`}
-          >
-            <p className={`text-xs font-medium ${onlyCritical ? 'text-red-100' : 'text-slate-500'}`}>
-              Kritik Stok Uyarısı {onlyCritical ? '(Filtre Açık)' : '(Filtrelemek için dokun)'}
-            </p>
-            <p
-              className={`text-2xl font-bold mt-1 ${
-                onlyCritical ? 'text-white' : stats.criticalCount > 0 ? 'text-red-600' : 'text-emerald-600'
-              }`}
-            >
-              {stats.criticalCount} Ürün
-            </p>
-            <p className={`text-xs mt-0.5 ${onlyCritical ? 'text-red-100' : 'text-slate-400'}`}>
-              Eşik değer ve altındaki kalemler
-            </p>
-          </button>
-        </div>
-
-        {/* Depo Sekmeleri ve Arama Filtreleri */}
-        <div className="bg-white rounded-xl p-4 shadow-sm border border-slate-200 space-y-3">
-          <div className="flex flex-wrap gap-2">
-            {[
-              { code: 'ALL', label: 'Tüm Depolar (3)' },
-              { code: 'DEPO-1', label: 'Pamukkale Depo' },
-              { code: 'DEPO-2', label: 'Merkezefendi Depo' },
-              { code: 'DEPO-3', label: 'Acıpayam Depo' },
-            ].map((w) => (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+              {/* 1. SEÇENEK: İŞLEM YAP */}
               <button
-                key={w.code}
-                onClick={() => setSelectedWarehouse(w.code)}
-                className={`px-3.5 py-2 rounded-lg text-xs sm:text-sm font-semibold transition ${
-                  selectedWarehouse === w.code
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
-                }`}
+                type="button"
+                onClick={() => setSupervisorView('OPERATIONS')}
+                className="text-left bg-white hover:border-blue-600 hover:shadow-lg rounded-2xl p-6 shadow-sm border-2 border-slate-200 transition flex flex-col justify-between space-y-5"
               >
-                {w.label}
+                <div className="space-y-2">
+                  <span className="inline-block px-3 py-1 text-xs font-bold bg-blue-100 text-blue-800 rounded-lg">
+                    1. Seçenek
+                  </span>
+                  <h3 className="text-2xl font-bold text-slate-900">İşlem Yap</h3>
+                  <p className="text-sm text-slate-600">
+                    Depo seçimi yapın, tekli veya çoklu ürün seçerek <strong>Stok Girişi, Stok Çıkışı, Depo/Raf Transferi, Sayım-Düzeltme</strong> ve <strong>Stok Sorgulama</strong> işlemlerini uygulayın.
+                  </p>
+                </div>
+
+                <div className="w-full py-3 text-center rounded-xl bg-blue-600 text-white font-bold text-sm">
+                  İşlem Ekranını Aç →
+                </div>
               </button>
-            ))}
-          </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Ürün kodu (KHV001), ürün adı, marka veya raf (A1) ara..."
-              className="sm:col-span-2 rounded-lg border border-slate-300 px-3.5 py-2 text-sm focus:border-blue-600 focus:outline-none"
-            />
-            <select
-              value={selectedCategory}
-              onChange={(e) => setSelectedCategory(e.target.value)}
-              className="rounded-lg border border-slate-300 px-3 py-2 text-sm bg-white focus:border-blue-600 focus:outline-none"
-            >
-              <option value="ALL">Tüm Kategoriler</option>
-              {categories.map((cat) => (
-                <option key={cat} value={cat}>
-                  {cat}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
+              {/* 2. SEÇENEK: RAPORLAR */}
+              <button
+                type="button"
+                onClick={() => setSupervisorView('REPORTS')}
+                className="text-left bg-white hover:border-slate-900 hover:shadow-lg rounded-2xl p-6 shadow-sm border-2 border-slate-200 transition flex flex-col justify-between space-y-5"
+              >
+                <div className="space-y-2">
+                  <span className="inline-block px-3 py-1 text-xs font-bold bg-amber-100 text-amber-800 rounded-lg">
+                    2. Seçenek
+                  </span>
+                  <h3 className="text-2xl font-bold text-slate-900">Raporlar</h3>
+                  <p className="text-sm text-slate-600">
+                    <strong>Stok Hareketleri, Kritik Stok Seviyeleri, Sayım Farkları</strong> ve <strong>Kullanıcı Bazlı İşlem Geçmişi</strong> raporlarını filtreleyip inceleyin.
+                  </p>
+                </div>
 
-        {/* Stok Listesi Tablosu */}
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-          {dataLoading ? (
-            <div className="p-8 text-center text-sm text-slate-500">Veriler yükleniyor...</div>
-          ) : filteredStocks.length === 0 ? (
-            <div className="p-8 text-center text-sm text-slate-500">
-              Arama kriterine uygun stok kaydı bulunamadı.
+                <div className="w-full py-3 text-center rounded-xl bg-slate-900 text-white font-bold text-sm">
+                  Raporlar Ekranını Aç →
+                </div>
+              </button>
             </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse text-sm">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-200 text-xs uppercase text-slate-500">
-                    <th className="py-3 px-4">Kod</th>
-                    <th className="py-3 px-4">Ürün / Marka</th>
-                    <th className="py-3 px-4">Depo & Raf</th>
-                    <th className="py-3 px-4">Birim / Ambalaj</th>
-                    <th className="py-3 px-4 text-right">Mevcut Stok</th>
-                    <th className="py-3 px-4 text-right">Kritik Eşik</th>
-                    <th className="py-3 px-4 text-center">Durum</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {filteredStocks.map((row) => (
-                    <tr
-                      key={row.id}
-                      className={row.isCritical ? 'bg-red-50/70' : 'hover:bg-slate-50'}
-                    >
-                      <td className="py-3 px-4 font-mono font-semibold text-xs text-slate-800">
-                        {row.product.sku}
-                      </td>
-                      <td className="py-3 px-4">
-                        <div className="font-semibold text-slate-900">{row.product.name}</div>
-                        <div className="text-xs text-slate-500">
-                          {row.product.brand} • {row.product.category}
-                        </div>
-                      </td>
-                      <td className="py-3 px-4">
-                        <div className="font-medium text-slate-800">
-                          {row.location.warehouse_name}
-                        </div>
-                        <span className="inline-block mt-0.5 px-2 py-0.5 text-xs font-mono font-semibold bg-slate-200 text-slate-800 rounded">
-                          Raf: {row.location.shelf_code}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-slate-600">
-                        {row.product.unit} ({row.product.pack_detail})
-                      </td>
-                      <td className="py-3 px-4 text-right font-bold text-base text-slate-900">
-                        {row.quantity}
-                      </td>
-                      <td className="py-3 px-4 text-right text-slate-500">
-                        {row.product.min_stock_level}
-                      </td>
-                      <td className="py-3 px-4 text-center">
-                        {row.isCritical ? (
-                          <span className="inline-block px-2.5 py-1 text-xs font-semibold rounded-full bg-red-100 text-red-700">
-                            Kritik Seviye
-                          </span>
-                        ) : (
-                          <span className="inline-block px-2.5 py-1 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-700">
-                            Normal
-                          </span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
+          </div>
+        ) : isSupervisor && supervisorView === 'REPORTS' ? (
+          <ReportsDashboard
+            locations={locations}
+            products={products}
+            stocks={stocks}
+            transactions={transactions}
+            profiles={profiles}
+            onBack={() => setSupervisorView('MENU')}
+            onRefresh={() => loadAllData(session.user.id)}
+          />
+        ) : (
+          <StockWorkflow
+            session={session}
+            profile={profile}
+            locations={locations}
+            products={products}
+            stocks={stocks}
+            transactions={transactions}
+            dataLoading={dataLoading}
+            onReloadData={loadAllData}
+            onBackToMenu={isSupervisor ? () => setSupervisorView('MENU') : null}
+          />
+        )}
       </main>
     </div>
   );
